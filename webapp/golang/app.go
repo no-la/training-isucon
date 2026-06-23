@@ -25,6 +25,7 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -513,7 +514,7 @@ var (
 	indexCacheMu   sync.RWMutex
 	indexCache     []Post
 	indexCacheTime time.Time
-	indexCacheTTL  = 5 * time.Second
+	indexCacheTTL  = 2 * time.Second
 )
 
 func invalidateIndexCache() {
@@ -521,6 +522,8 @@ func invalidateIndexCache() {
 	indexCache = nil
 	indexCacheMu.Unlock()
 }
+
+var indexFlight singleflight.Group
 
 func cachedIndexPosts(ctx context.Context) ([]Post, error) {
 	indexCacheMu.RLock()
@@ -531,24 +534,38 @@ func cachedIndexPosts(ctx context.Context) ([]Post, error) {
 	}
 	indexCacheMu.RUnlock()
 
-	var results []Post
-	err := db.SelectContext(ctx, &results,
-		"SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` "+
-			"FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` "+
-			"WHERE u.`del_flg` = 0 "+
-			"ORDER BY p.`created_at` DESC LIMIT 20")
+	v, err, _ := indexFlight.Do("index", func() (any, error) {
+		// double-check: 先行 goroutine が更新してる可能性
+		indexCacheMu.RLock()
+		if indexCache != nil && time.Since(indexCacheTime) < indexCacheTTL {
+			c := indexCache
+			indexCacheMu.RUnlock()
+			return c, nil
+		}
+		indexCacheMu.RUnlock()
+
+		var results []Post
+		if err := db.SelectContext(ctx, &results,
+			"SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` "+
+				"FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` "+
+				"WHERE u.`del_flg` = 0 "+
+				"ORDER BY p.`created_at` DESC LIMIT 20"); err != nil {
+			return nil, err
+		}
+		posts, err := makePosts(ctx, results, "", false)
+		if err != nil {
+			return nil, err
+		}
+		indexCacheMu.Lock()
+		indexCache = posts
+		indexCacheTime = time.Now()
+		indexCacheMu.Unlock()
+		return posts, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	posts, err := makePosts(ctx, results, "", false)
-	if err != nil {
-		return nil, err
-	}
-	indexCacheMu.Lock()
-	indexCache = posts
-	indexCacheTime = time.Now()
-	indexCacheMu.Unlock()
-	return posts, nil
+	return v.([]Post), nil
 }
 
 func getInitialize(w http.ResponseWriter, r *http.Request) {
@@ -871,7 +888,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 			log.Printf("disk write: %v", err)
 		}
 	}
-	invalidateIndexCache()
+	// INDEX_CACHE は TTL 任せ。POST のたび invalidate すると thundering herd で MySQL に殺到する
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
