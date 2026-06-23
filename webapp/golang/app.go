@@ -547,6 +547,18 @@ var (
 	postCacheTTL    = 1 * time.Second
 )
 
+// GET /posts?max_created_at=X を string キーでキャッシュ
+type cachedPostsList struct {
+	posts   []Post
+	expires time.Time
+}
+
+var (
+	postsListCacheMap    sync.Map // map[string]*cachedPostsList
+	postsListCacheFlight singleflight.Group
+	postsListCacheTTL    = 1 * time.Second
+)
+
 func invalidatePostCache(id int) {
 	postCacheMap.Delete(id)
 }
@@ -834,24 +846,10 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	if maxCreatedAt == "" {
 		return
 	}
-	t, err := time.Parse(ISO8601Format, maxCreatedAt)
+	posts, err := getCachedPostsList(ctx, maxCreatedAt)
 	if err != nil {
 		log.Print(err)
-		return
-	}
-	var results []Post
-	err = db.SelectContext(ctx, &results,
-		"SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` "+
-			"FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` "+
-			"WHERE u.`del_flg` = 0 AND p.`created_at` <= ? "+
-			"ORDER BY p.`created_at` DESC LIMIT 20", t.Format(ISO8601Format))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if len(posts) == 0 {
@@ -859,6 +857,50 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tmplPosts.Execute(w, posts)
+}
+
+func getCachedPostsList(ctx context.Context, maxCreatedAt string) ([]Post, error) {
+	if v, ok := postsListCacheMap.Load(maxCreatedAt); ok {
+		c := v.(*cachedPostsList)
+		if time.Now().Before(c.expires) {
+			return c.posts, nil
+		}
+	}
+
+	v, err, _ := postsListCacheFlight.Do(maxCreatedAt, func() (any, error) {
+		if v, ok := postsListCacheMap.Load(maxCreatedAt); ok {
+			c := v.(*cachedPostsList)
+			if time.Now().Before(c.expires) {
+				return c.posts, nil
+			}
+		}
+
+		t, err := time.Parse(ISO8601Format, maxCreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		var results []Post
+		if err := db.SelectContext(ctx, &results,
+			"SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` "+
+				"FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` "+
+				"WHERE u.`del_flg` = 0 AND p.`created_at` <= ? "+
+				"ORDER BY p.`created_at` DESC LIMIT 20", t.Format(ISO8601Format)); err != nil {
+			return nil, err
+		}
+		posts, err := makePosts(ctx, results, "", false)
+		if err != nil {
+			return nil, err
+		}
+		postsListCacheMap.Store(maxCreatedAt, &cachedPostsList{
+			posts:   posts,
+			expires: time.Now().Add(postsListCacheTTL),
+		})
+		return posts, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]Post), nil
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
