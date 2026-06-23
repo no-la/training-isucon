@@ -409,7 +409,8 @@ func init() {
 	}
 	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.SetFlags(log.Ldate | log.Ltime)
+	log.SetOutput(io.Discard) // bench 中はログを破棄して stderr write のロック競合を排除
 }
 
 func dbInitialize(ctx context.Context) {
@@ -1316,7 +1317,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 	postID, err := strconv.Atoi(r.FormValue("post_id"))
 	if err != nil {
-		log.Print("post_idは整数のみです")
+		// クライアントエラー: ログ不要
 		return
 	}
 	commentText := r.FormValue("comment")
