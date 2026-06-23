@@ -246,6 +246,49 @@ func postCountByUser(userID int) int {
 	return n
 }
 
+// comments を post_id ごとに created_at DESC の slice で保持
+var (
+	commentsByPost   = map[int][]Comment{}
+	commentsCacheMu  sync.RWMutex
+)
+
+func reloadCommentsCache(ctx context.Context) error {
+	var all []Comment
+	if err := db.SelectContext(ctx, &all,
+		"SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` ORDER BY `post_id`, `created_at` DESC"); err != nil {
+		return err
+	}
+	m := make(map[int][]Comment, 16384)
+	for _, c := range all {
+		m[c.PostID] = append(m[c.PostID], c)
+	}
+	commentsCacheMu.Lock()
+	commentsByPost = m
+	commentsCacheMu.Unlock()
+	return nil
+}
+
+// limit=0 で全件、>0 で上位 limit 件 (created_at DESC で並んでいるので先頭から)
+func commentsByPostID(postID, limit int) []Comment {
+	commentsCacheMu.RLock()
+	src := commentsByPost[postID]
+	commentsCacheMu.RUnlock()
+	if limit <= 0 || limit >= len(src) {
+		out := make([]Comment, len(src))
+		copy(out, src)
+		return out
+	}
+	out := make([]Comment, limit)
+	copy(out, src[:limit])
+	return out
+}
+
+func prependComment(c Comment) {
+	commentsCacheMu.Lock()
+	commentsByPost[c.PostID] = append([]Comment{c}, commentsByPost[c.PostID]...)
+	commentsCacheMu.Unlock()
+}
+
 // users 全件オンメモリ。1007 件 + α、変更は POST /register, /admin/banned, /initialize のみ
 var (
 	usersByID      = map[int]User{}
@@ -363,6 +406,7 @@ func dbInitialize(ctx context.Context) {
 	_ = reloadUsersCache(ctx)
 	_ = reloadCommentCountCache(ctx)
 	_ = reloadPostsCache(ctx)
+	_ = reloadCommentsCache(ctx)
 	// /posts_list_cache, post_detail_cache は何のキーで保持してるか分からないので消す
 	postsListCacheMap = sync.Map{}
 	postCacheMap = sync.Map{}
@@ -566,24 +610,15 @@ func fetchCommentCounts(ctx context.Context, ids []int) (map[int]int, error) {
 }
 
 func fetchCommentsByPostIDs(ctx context.Context, ids []int, allComments bool) (map[int][]Comment, error) {
-	if len(ids) == 0 {
-		return map[int][]Comment{}, nil
-	}
-	var comments []Comment
-	q := "SELECT * FROM `comments` WHERE `post_id` IN (" + placeholders(len(ids)) +
-		") ORDER BY `post_id`, `created_at` DESC"
-	if err := db.SelectContext(ctx, &comments, q, intsToArgs(ids)...); err != nil {
-		return nil, err
-	}
 	out := make(map[int][]Comment, len(ids))
-	for _, c := range comments {
-		out[c.PostID] = append(out[c.PostID], c)
+	limit := 3
+	if allComments {
+		limit = 0
 	}
-	if !allComments {
-		for k, v := range out {
-			if len(v) > 3 {
-				out[k] = v[:3]
-			}
+	for _, id := range ids {
+		cs := commentsByPostID(id, limit)
+		if len(cs) > 0 {
+			out[id] = cs
 		}
 	}
 	return out, nil
@@ -1208,13 +1243,23 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print("post_idは整数のみです")
 		return
 	}
-	if _, err := db.ExecContext(ctx,
+	commentText := r.FormValue("comment")
+	res, err := db.ExecContext(ctx,
 		"INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)",
-		postID, me.ID, r.FormValue("comment")); err != nil {
+		postID, me.ID, commentText)
+	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	cid, _ := res.LastInsertId()
+	prependComment(Comment{
+		ID:        int(cid),
+		PostID:    postID,
+		UserID:    me.ID,
+		Comment:   commentText,
+		CreatedAt: time.Now(),
+	})
 	incCommentCount(postID, me.ID)
 	invalidatePostCache(postID)
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
@@ -1327,6 +1372,9 @@ func main() {
 	}
 	if err := reloadPostsCache(context.Background()); err != nil {
 		log.Printf("warm posts cache: %v", err)
+	}
+	if err := reloadCommentsCache(context.Background()); err != nil {
+		log.Printf("warm comments cache: %v", err)
 	}
 
 	r := chi.NewRouter()
