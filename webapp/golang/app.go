@@ -198,8 +198,18 @@ func templPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
+func bodyHTML(body string) template.HTML {
+	escaped := template.HTMLEscapeString(body)
+	escaped = strings.ReplaceAll(escaped, "\r\n", "<br>")
+	escaped = strings.ReplaceAll(escaped, "\n", "<br>")
+	return template.HTML(escaped)
+}
+
 func parseTemplates() {
-	fmap := template.FuncMap{"imageURL": imageURL}
+	fmap := template.FuncMap{
+		"imageURL": imageURL,
+		"bodyHTML": bodyHTML,
+	}
 	tmplIndex = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		templPath("layout.html"), templPath("index.html"), templPath("posts.html"), templPath("post.html"),
 	))
@@ -525,6 +535,69 @@ func invalidateIndexCache() {
 
 var indexFlight singleflight.Group
 
+// post_id ごとに make_posts 結果 (all_comments=true) を短期キャッシュ
+type cachedPost struct {
+	post    Post
+	expires time.Time
+}
+
+var (
+	postCacheMap    sync.Map // map[int]*cachedPost
+	postCacheFlight singleflight.Group
+	postCacheTTL    = 1 * time.Second
+)
+
+func invalidatePostCache(id int) {
+	postCacheMap.Delete(id)
+}
+
+func cachedPostDetail(ctx context.Context, id int, csrfToken string) (*Post, error) {
+	if v, ok := postCacheMap.Load(id); ok {
+		c := v.(*cachedPost)
+		if time.Now().Before(c.expires) {
+			p := c.post
+			p.CSRFToken = csrfToken
+			return &p, nil
+		}
+	}
+
+	v, err, _ := postCacheFlight.Do(strconv.Itoa(id), func() (any, error) {
+		// double-check
+		if v, ok := postCacheMap.Load(id); ok {
+			c := v.(*cachedPost)
+			if time.Now().Before(c.expires) {
+				return c, nil
+			}
+		}
+
+		var results []Post
+		if err := db.SelectContext(ctx, &results,
+			"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", id); err != nil {
+			return nil, err
+		}
+		posts, err := makePosts(ctx, results, "", true)
+		if err != nil {
+			return nil, err
+		}
+		if len(posts) == 0 {
+			return nil, nil
+		}
+		entry := &cachedPost{post: posts[0], expires: time.Now().Add(postCacheTTL)}
+		postCacheMap.Store(id, entry)
+		return entry, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	c := v.(*cachedPost)
+	p := c.post
+	p.CSRFToken = csrfToken
+	return &p, nil
+}
+
 func cachedIndexPosts(ctx context.Context) ([]Post, error) {
 	indexCacheMu.RLock()
 	if indexCache != nil && time.Since(indexCacheTime) < indexCacheTTL {
@@ -795,18 +868,13 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	var results []Post
-	if err := db.SelectContext(ctx, &results,
-		"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid); err != nil {
-		log.Print(err)
-		return
-	}
-	posts, err := makePosts(ctx, results, getCSRFToken(r), true)
+	p, err := cachedPostDetail(ctx, pid, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if len(posts) == 0 {
+	if p == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -814,7 +882,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	tmplPost.Execute(w, struct {
 		Post Post
 		Me   User
-	}{posts[0], me})
+	}{*p, me})
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
@@ -922,6 +990,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	incCommentCount(postID, me.ID)
+	invalidatePostCache(postID)
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
