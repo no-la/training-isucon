@@ -358,18 +358,17 @@ module Isuconp
 
         params['file'][:tempfile].rewind
         imgdata = params["file"][:tempfile].read
-        query = 'INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)'
+        query = 'INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)'
         db.prepare(query).execute(
           me[:id],
           mime,
-          imgdata,
           params["body"],
         )
         pid = db.last_id
 
         ext = IMAGE_EXT[mime]
         if ext
-          FileUtils.mkdir_p(IMAGE_DIR)
+          FileUtils.mkdir_p(IMAGE_DIR) unless Dir.exist?(IMAGE_DIR)
           File.binwrite("#{IMAGE_DIR}/#{pid}.#{ext}", imgdata)
         end
 
@@ -381,27 +380,9 @@ module Isuconp
     end
 
     get '/image/:id.:ext' do
-      if params[:id].to_i == 0
-        return ""
-      end
-
-      post = db.prepare('SELECT `id`, `mime`, `imgdata` FROM `posts` WHERE `id` = ?').execute(params[:id].to_i).first
-
-      if (params[:ext] == "jpg" && post[:mime] == "image/jpeg") ||
-          (params[:ext] == "png" && post[:mime] == "image/png") ||
-          (params[:ext] == "gif" && post[:mime] == "image/gif")
-        # 次回以降は nginx の try_files でディスクから返るようにキャッシュする
-        ext = IMAGE_EXT[post[:mime]]
-        if ext
-          FileUtils.mkdir_p(IMAGE_DIR)
-          path = "#{IMAGE_DIR}/#{post[:id]}.#{ext}"
-          File.binwrite(path, post[:imgdata]) unless File.exist?(path)
-        end
-        headers['Content-Type'] = post[:mime]
-        return post[:imgdata]
-      end
-
-      return 404
+      # nginx try_files で disk から返す。imgdata は DB 上に存在しないため、
+      # ここに来るのは disk ミス時のみ。POST 直後の race 程度。
+      404
     end
 
     post '/comment' do
