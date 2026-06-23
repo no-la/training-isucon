@@ -1,7 +1,8 @@
 require 'sinatra/base'
 require 'mysql2'
 require 'rack-flash'
-require 'shellwords'
+require 'openssl'
+require 'fileutils'
 require 'rack/session/dalli'
 
 module Isuconp
@@ -80,8 +81,7 @@ module Isuconp
       end
 
       def digest(src)
-        # opensslのバージョンによっては (stdin)= というのがつくので取る
-        `printf "%s" #{Shellwords.shellescape(src)} | openssl dgst -sha512 | sed 's/^.*= //'`.strip
+        OpenSSL::Digest::SHA512.hexdigest(src)
       end
 
       def calculate_salt(account_name)
@@ -103,35 +103,56 @@ module Isuconp
       end
 
       def make_posts(results, all_comments: false)
-        posts = []
-        results.to_a.each do |post|
-          post[:comment_count] = db.prepare('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?').execute(
-            post[:id]
-          ).first[:count]
+        rows = results.to_a
+        return [] if rows.empty?
 
-          query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-          unless all_comments
-            query += ' LIMIT 3'
+        user_ids = rows.map { |p| p[:user_id] }.uniq
+        users = fetch_users_by_ids(user_ids)
+        # del_flg=0 のユーザーの投稿だけ通し、POSTS_PER_PAGE まで残す
+        kept = rows.select { |p| u = users[p[:user_id]]; u && u[:del_flg] == 0 }.first(POSTS_PER_PAGE)
+        return [] if kept.empty?
+
+        post_ids = kept.map { |p| p[:id] }
+        comment_counts = fetch_comment_counts_by_post_ids(post_ids)
+        comments_by_post = fetch_comments_by_post_ids(post_ids, all_comments: all_comments)
+
+        # comments に紐づく user を一括取得
+        comment_user_ids = comments_by_post.values.flatten.map { |c| c[:user_id] }.uniq
+        comment_users = fetch_users_by_ids(comment_user_ids)
+
+        kept.map do |post|
+          comments = (comments_by_post[post[:id]] || []).map do |c|
+            c[:user] = comment_users[c[:user_id]]
+            c
           end
-          comments = db.prepare(query).execute(
-            post[:id]
-          ).to_a
-          comments.each do |comment|
-            comment[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-              comment[:user_id]
-            ).first
-          end
+          post[:comment_count] = comment_counts[post[:id]] || 0
           post[:comments] = comments.reverse
-
-          post[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            post[:user_id]
-          ).first
-
-          posts.push(post) if post[:user][:del_flg] == 0
-          break if posts.length >= POSTS_PER_PAGE
+          post[:user] = users[post[:user_id]]
+          post
         end
+      end
 
-        posts
+      def fetch_users_by_ids(ids)
+        return {} if ids.empty?
+        placeholders = (['?'] * ids.length).join(',')
+        rows = db.prepare("SELECT * FROM `users` WHERE `id` IN (#{placeholders})").execute(*ids).to_a
+        rows.each_with_object({}) { |u, h| h[u[:id]] = u }
+      end
+
+      def fetch_comment_counts_by_post_ids(ids)
+        return {} if ids.empty?
+        placeholders = (['?'] * ids.length).join(',')
+        rows = db.prepare("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (#{placeholders}) GROUP BY `post_id`").execute(*ids).to_a
+        rows.each_with_object(Hash.new(0)) { |r, h| h[r[:post_id]] = r[:count] }
+      end
+
+      def fetch_comments_by_post_ids(ids, all_comments:)
+        return {} if ids.empty?
+        placeholders = (['?'] * ids.length).join(',')
+        rows = db.prepare("SELECT * FROM `comments` WHERE `post_id` IN (#{placeholders}) ORDER BY `post_id`, `created_at` DESC").execute(*ids).to_a
+        grouped = rows.group_by { |c| c[:post_id] }
+        return grouped if all_comments
+        grouped.transform_values { |cs| cs.first(3) }
       end
 
       def image_url(post)
@@ -228,7 +249,12 @@ module Isuconp
     get '/' do
       me = get_session_user()
 
-      results = db.query('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
+      results = db.query(
+        'SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`created_at`, p.`mime` ' \
+        'FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` ' \
+        'WHERE u.`del_flg` = 0 ' \
+        'ORDER BY p.`created_at` DESC LIMIT 20'
+      )
       posts = make_posts(results)
 
       erb :index, layout: :layout, locals: { posts: posts, me: me }
@@ -243,7 +269,7 @@ module Isuconp
         return 404
       end
 
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC').execute(
+      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20').execute(
         user[:id]
       )
       posts = make_posts(results)
@@ -272,7 +298,12 @@ module Isuconp
 
     get '/posts' do
       max_created_at = params['max_created_at']
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC').execute(
+      results = db.prepare(
+        'SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` ' \
+        'FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` ' \
+        'WHERE u.`del_flg` = 0 AND p.`created_at` <= ? ' \
+        'ORDER BY p.`created_at` DESC LIMIT 20'
+      ).execute(
         max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime
       )
       posts = make_posts(results)
@@ -338,7 +369,6 @@ module Isuconp
 
         ext = IMAGE_EXT[mime]
         if ext
-          require 'fileutils'
           FileUtils.mkdir_p(IMAGE_DIR)
           File.binwrite("#{IMAGE_DIR}/#{pid}.#{ext}", imgdata)
         end
@@ -363,7 +393,6 @@ module Isuconp
         # 次回以降は nginx の try_files でディスクから返るようにキャッシュする
         ext = IMAGE_EXT[post[:mime]]
         if ext
-          require 'fileutils'
           FileUtils.mkdir_p(IMAGE_DIR)
           path = "#{IMAGE_DIR}/#{post[:id]}.#{ext}"
           File.binwrite(path, post[:imgdata]) unless File.exist?(path)

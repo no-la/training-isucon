@@ -1,0 +1,13 @@
+[mysqld]
+# innodb は durability より throughput を優先（再起動時のデータ要件は満たす）
+innodb_buffer_pool_size = 1500M
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+innodb_log_buffer_size = 32M
+innodb_io_capacity = 1000
+
+# binlog 同期はベンチ間で不要
+sync_binlog = 0
+disable-log-bin
+
+max_connections = 512
