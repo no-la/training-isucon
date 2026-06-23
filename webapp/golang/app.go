@@ -1367,7 +1367,14 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	})
 	incCommentCount(postID, me.ID)
 	invalidatePostCache(postID)
-	bumpCacheVersion()
+	// その post_id 向けの HTML キャッシュだけ消す (cacheVersion を bump すると / のヒット率が爆下がりする)
+	prefix := strconv.Itoa(postID) + "|"
+	postHTMLCache.Range(func(k, _ any) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
+			postHTMLCache.Delete(k)
+		}
+		return true
+	})
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
