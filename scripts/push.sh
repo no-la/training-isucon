@@ -22,7 +22,7 @@ rsync "${RSYNC_OPTS[@]}" \
 # etc 配下は root 権限が要るのでステージしてから sudo cp
 if [[ -d "$REPO/etc" ]]; then
   rsync "${RSYNC_OPTS[@]}" "$REPO/etc/" "$USER@$HOST:/tmp/training-isucon-etc/"
-  $SSH "$USER@$HOST" 'sudo rsync -a /tmp/training-isucon-etc/ /etc/ && rm -rf /tmp/training-isucon-etc && sudo systemctl daemon-reload'
+  $SSH "$USER@$HOST" 'sudo rsync -a /tmp/training-isucon-etc/ /etc/ && rm -rf /tmp/training-isucon-etc'
 fi
 
 echo "push done"
