@@ -436,6 +436,7 @@ func dbInitialize(ctx context.Context) {
 	postHTMLCache = sync.Map{}
 	invalidateIndexCache()
 	bumpCacheVersion()
+	resetStats()
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
@@ -722,10 +723,34 @@ var (
 	indexHTMLCache sync.Map // map[string]*cachedHTML
 	postHTMLCache  sync.Map // map[string]*cachedHTML  (key = postID + "|" + csrf + "|" + meID)
 	cacheVersion   atomic.Uint64
+
+	// 計測: cache hit/miss を atomic で記録、/debug/stats で読む
+	indexHits    atomic.Uint64
+	indexMisses  atomic.Uint64
+	postHits     atomic.Uint64
+	postMisses   atomic.Uint64
+	versionBumps atomic.Uint64
 )
+
+func resetStats() {
+	indexHits.Store(0)
+	indexMisses.Store(0)
+	postHits.Store(0)
+	postMisses.Store(0)
+	versionBumps.Store(0)
+}
 
 func bumpCacheVersion() {
 	cacheVersion.Add(1)
+	versionBumps.Add(1)
+}
+
+func hitRate(hits, misses uint64) float64 {
+	total := hits + misses
+	if total == 0 {
+		return 0.0
+	}
+	return float64(hits) / float64(total)
 }
 
 // post_id ごとに make_posts 結果 (all_comments=true) を短期キャッシュ
@@ -979,10 +1004,12 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		if v, ok := indexHTMLCache.Load(cacheKey); ok {
 			c := v.(*cachedHTML)
 			if c.version == curVer && time.Now().Before(c.expires) {
+				indexHits.Add(1)
 				_, _ = w.Write(c.html)
 				return
 			}
 		}
+		indexMisses.Add(1)
 	}
 
 	cached, err := cachedIndexPosts(ctx)
@@ -1197,14 +1224,17 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	csrfToken := getCSRFToken(r)
 	me := getSessionUser(r)
 	cacheKey := strconv.Itoa(pid) + "|" + csrfToken + "|" + strconv.Itoa(me.ID)
-	curVer := cacheVersion.Load()
+	// post HTML cache は POST /comment で該当 post_id だけ削除する設計なので
+	// global cacheVersion とは無関係に TTL のみで判定する
 	if v, ok := postHTMLCache.Load(cacheKey); ok {
 		c := v.(*cachedHTML)
-		if c.version == curVer && time.Now().Before(c.expires) {
+		if time.Now().Before(c.expires) {
+			postHits.Add(1)
 			_, _ = w.Write(c.html)
 			return
 		}
 	}
+	postMisses.Add(1)
 
 	p, err := cachedPostDetail(ctx, pid, csrfToken)
 	if err != nil {
@@ -1231,7 +1261,6 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	copy(html, buf.Bytes())
 	postHTMLCache.Store(cacheKey, &cachedHTML{
 		html:    html,
-		version: curVer,
 		expires: time.Now().Add(1 * time.Second),
 	})
 	_, _ = w.Write(buf.Bytes())
@@ -1508,6 +1537,21 @@ func main() {
 	r.Get("/admin/banned", getAdminBanned)
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
+	// 計測用エンドポイント (bench からは叩かれない /debug/* 配下)
+	r.Get("/debug/stats", func(w http.ResponseWriter, r *http.Request) {
+		ih := indexHits.Load()
+		im := indexMisses.Load()
+		ph := postHits.Load()
+		pm := postMisses.Load()
+		vb := versionBumps.Load()
+		fmt.Fprintf(w, "index hits=%d misses=%d hit_rate=%.3f\n", ih, im, hitRate(ih, im))
+		fmt.Fprintf(w, "post  hits=%d misses=%d hit_rate=%.3f\n", ph, pm, hitRate(ph, pm))
+		fmt.Fprintf(w, "version_bumps=%d (cacheVersion=%d)\n", vb, cacheVersion.Load())
+	})
+	r.Post("/debug/reset", func(w http.ResponseWriter, r *http.Request) {
+		resetStats()
+		w.Write([]byte("ok\n"))
+	})
 	r.Mount("/", http.FileServer(http.Dir("../public")))
 
 	// Unix domain socket で nginx と通信。TCP localhost より context switch / syscall が少ない
