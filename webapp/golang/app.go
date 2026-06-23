@@ -559,6 +559,26 @@ var (
 	postsListCacheTTL    = 1 * time.Second
 )
 
+// GET /@account_name のページ材料をキャッシュ
+type cachedUserPage struct {
+	posts          []Post
+	user           User
+	postCount      int
+	commentCount   int
+	commentedCount int
+	expires        time.Time
+}
+
+var (
+	userPageCacheMap    sync.Map // map[string]*cachedUserPage
+	userPageCacheFlight singleflight.Group
+	userPageCacheTTL    = 1 * time.Second
+)
+
+func invalidateUserPageCache(accountName string) {
+	userPageCacheMap.Delete(accountName)
+}
+
 func invalidatePostCache(id int) {
 	postCacheMap.Delete(id)
 }
@@ -786,43 +806,22 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 func getAccountName(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accountName := r.PathValue("accountName")
-	user, ok := userByName(accountName)
-	if !ok || user.DelFlg != 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	var results []Post
-	if err := db.SelectContext(ctx, &results,
-		"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` "+
-			"WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID); err != nil {
-		log.Print(err)
-		return
-	}
-	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
+	data, err := getCachedUserPage(ctx, accountName)
 	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	commentCount := getCommentCountForUser(user.ID)
-	postCount := 0
-	if err := db.GetContext(ctx, &postCount,
-		"SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID); err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	commentedCount := 0
-	if postCount > 0 {
-		if err := db.GetContext(ctx, &commentedCount,
-			"SELECT COUNT(*) AS count FROM `comments` c JOIN `posts` p ON c.`post_id` = p.`id` WHERE p.`user_id` = ?", user.ID); err != nil {
-			log.Print(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+	if data == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
-
+	csrfToken := getCSRFToken(r)
+	posts := make([]Post, len(data.posts))
+	for i, p := range data.posts {
+		p.CSRFToken = csrfToken
+		posts[i] = p
+	}
 	me := getSessionUser(r)
 	tmplUser.Execute(w, struct {
 		Posts          []Post
@@ -831,7 +830,73 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{posts, data.user, data.postCount, data.commentCount, data.commentedCount, me})
+}
+
+func getCachedUserPage(ctx context.Context, accountName string) (*cachedUserPage, error) {
+	if v, ok := userPageCacheMap.Load(accountName); ok {
+		c := v.(*cachedUserPage)
+		if time.Now().Before(c.expires) {
+			return c, nil
+		}
+	}
+
+	v, err, _ := userPageCacheFlight.Do(accountName, func() (any, error) {
+		if v, ok := userPageCacheMap.Load(accountName); ok {
+			c := v.(*cachedUserPage)
+			if time.Now().Before(c.expires) {
+				return c, nil
+			}
+		}
+
+		user, ok := userByName(accountName)
+		if !ok || user.DelFlg != 0 {
+			return nil, nil
+		}
+
+		var results []Post
+		if err := db.SelectContext(ctx, &results,
+			"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` "+
+				"WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID); err != nil {
+			return nil, err
+		}
+		posts, err := makePosts(ctx, results, "", false)
+		if err != nil {
+			return nil, err
+		}
+
+		commentCount := getCommentCountForUser(user.ID)
+		postCount := 0
+		if err := db.GetContext(ctx, &postCount,
+			"SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID); err != nil {
+			return nil, err
+		}
+		commentedCount := 0
+		if postCount > 0 {
+			if err := db.GetContext(ctx, &commentedCount,
+				"SELECT COUNT(*) AS count FROM `comments` c JOIN `posts` p ON c.`post_id` = p.`id` WHERE p.`user_id` = ?", user.ID); err != nil {
+				return nil, err
+			}
+		}
+
+		entry := &cachedUserPage{
+			posts:          posts,
+			user:           user,
+			postCount:      postCount,
+			commentCount:   commentCount,
+			commentedCount: commentedCount,
+			expires:        time.Now().Add(userPageCacheTTL),
+		}
+		userPageCacheMap.Store(accountName, entry)
+		return entry, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	return v.(*cachedUserPage), nil
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -846,15 +911,21 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	if maxCreatedAt == "" {
 		return
 	}
-	posts, err := getCachedPostsList(ctx, maxCreatedAt)
+	cached, err := getCachedPostsList(ctx, maxCreatedAt)
 	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if len(posts) == 0 {
+	if len(cached) == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
+	}
+	csrfToken := getCSRFToken(r)
+	posts := make([]Post, len(cached))
+	for i, p := range cached {
+		p.CSRFToken = csrfToken
+		posts[i] = p
 	}
 	tmplPosts.Execute(w, posts)
 }
