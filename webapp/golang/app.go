@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"crypto/sha512"
@@ -351,6 +352,24 @@ var (
 
 func templPath(filename string) string {
 	return path.Join("templates", filename)
+}
+
+// テンプレートのレンダリングを 1 度バッファに溜めてから ResponseWriter に一括書き込み。
+// sync.Pool で Buffer 再利用 → GC 圧と alloc を削減
+var bufPool = sync.Pool{
+	New: func() any { return bytes.NewBuffer(make([]byte, 0, 64*1024)) },
+}
+
+func renderTemplate(w http.ResponseWriter, tmpl *template.Template, data any) {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := tmpl.Execute(buf, data); err != nil {
+		log.Print(err)
+		bufPool.Put(buf)
+		return
+	}
+	_, _ = w.Write(buf.Bytes())
+	bufPool.Put(buf)
 }
 
 func bodyHTML(body string) template.HTML {
@@ -829,7 +848,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	tmplLogin.Execute(w, struct {
+	renderTemplate(w, tmplLogin, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -861,7 +880,7 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	tmplRegister.Execute(w, struct {
+	renderTemplate(w, tmplRegister, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -940,7 +959,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		posts[i] = p
 	}
 
-	tmplIndex.Execute(w, struct {
+	renderTemplate(w, tmplIndex, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
@@ -978,7 +997,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	}
 
 	me := getSessionUser(r)
-	tmplUser.Execute(w, struct {
+	renderTemplate(w, tmplUser, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -1073,7 +1092,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	tmplPosts.Execute(w, posts)
+	renderTemplate(w, tmplPosts, posts)
 }
 
 func getCachedPostsList(ctx context.Context, maxCreatedAt string) ([]Post, error) {
@@ -1131,7 +1150,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := getSessionUser(r)
-	tmplPost.Execute(w, struct {
+	renderTemplate(w, tmplPost, struct {
 		Post Post
 		Me   User
 	}{*p, me})
@@ -1283,7 +1302,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	tmplAdminBanned.Execute(w, struct {
+	renderTemplate(w, tmplAdminBanned, struct {
 		Users     []User
 		Me        User
 		CSRFToken string
