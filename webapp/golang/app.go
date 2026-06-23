@@ -342,14 +342,13 @@ func upsertUser(u User) {
 
 // 起動時に一度だけパースしておく（毎リクエスト ParseFiles するコストを排除）
 var (
-	tmplIndex        *template.Template
-	tmplUser         *template.Template
-	tmplPosts        *template.Template
-	tmplPost         *template.Template
-	tmplLogin        *template.Template
+	tmplIndex       *template.Template
+	tmplUser        *template.Template
+	tmplPosts       *template.Template
+	tmplPost        *template.Template
+	tmplLogin       *template.Template
 	tmplRegister    *template.Template
-	tmplAdminBanned  *template.Template
-	tmplPostHTMLOnly *template.Template // post.html 単体 (fragment 用)
+	tmplAdminBanned *template.Template
 )
 
 func templPath(filename string) string {
@@ -381,26 +380,10 @@ func bodyHTML(body string) template.HTML {
 	return template.HTML(escaped)
 }
 
-// fmap 関数: post の cached fragment を chunked write で組み立てる。
-// strings.Builder で 1 個ずつビルド (alloc は 1 個分の Builder のみ)
-func postHTMLFunc(p Post) template.HTML {
-	f := getOrCachePostFragment(p)
-	var sb strings.Builder
-	sb.Grow(2048)
-	for i, chunk := range f.chunks {
-		sb.Write(chunk)
-		if i < len(f.slots) && f.slots[i] {
-			sb.WriteString(p.CSRFToken)
-		}
-	}
-	return template.HTML(sb.String())
-}
-
 func parseTemplates() {
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
 		"bodyHTML": bodyHTML,
-		"postHTML": postHTMLFunc,
 	}
 	tmplIndex = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		templPath("layout.html"), templPath("index.html"), templPath("posts.html"), templPath("post.html"),
@@ -413,10 +396,6 @@ func parseTemplates() {
 	))
 	tmplPost = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		templPath("layout.html"), templPath("post_id.html"), templPath("post.html"),
-	))
-	// fragment 用: post.html 単体
-	tmplPostHTMLOnly = template.Must(template.New("post.html").Funcs(fmap).ParseFiles(
-		templPath("post.html"),
 	))
 	tmplLogin = template.Must(template.ParseFiles(templPath("layout.html"), templPath("login.html")))
 	tmplRegister = template.Must(template.ParseFiles(templPath("layout.html"), templPath("register.html")))
@@ -729,72 +708,6 @@ func invalidateIndexCache() {
 }
 
 var indexFlight singleflight.Group
-
-// post 単位の render 済 HTML フラグメント (top3 comments 版)。CSRFToken は
-// placeholder、per-request の postHTML fmap で chunked write 時に差し替え。
-const phPostCSRF = "ZZZPOSTCSRFXYZZZ"
-
-type postFragment struct {
-	chunks [][]byte
-	// slots[i] == true なら chunks[i] と chunks[i+1] の間に CSRFToken を挿入
-	slots []bool
-}
-
-var (
-	postFragmentsTop3 sync.Map // map[int]*postFragment
-	fragmentFlight    singleflight.Group
-)
-
-func invalidatePostFragment(id int) {
-	postFragmentsTop3.Delete(id)
-}
-
-// post.html を 1 個分 render してフラグメント化
-func renderPostFragment(p Post) *postFragment {
-	// p の CSRFToken を placeholder に差し替えて post.html を render
-	p.CSRFToken = phPostCSRF
-
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	// tmplPostHTMLOnly: post.html だけを実行する小さい template
-	if err := tmplPostHTMLOnly.Execute(buf, p); err != nil {
-		bufPool.Put(buf)
-		return &postFragment{chunks: [][]byte{[]byte("")}, slots: nil}
-	}
-
-	// chunk 化: placeholder で分割
-	bs := append([]byte(nil), buf.Bytes()...)
-	bufPool.Put(buf)
-
-	frag := &postFragment{}
-	rest := bs
-	for {
-		idx := bytes.Index(rest, []byte(phPostCSRF))
-		if idx < 0 {
-			frag.chunks = append(frag.chunks, rest)
-			break
-		}
-		frag.chunks = append(frag.chunks, rest[:idx])
-		frag.slots = append(frag.slots, true)
-		rest = rest[idx+len(phPostCSRF):]
-	}
-	return frag
-}
-
-func getOrCachePostFragment(p Post) *postFragment {
-	if v, ok := postFragmentsTop3.Load(p.ID); ok {
-		return v.(*postFragment)
-	}
-	v, _, _ := fragmentFlight.Do(strconv.Itoa(p.ID), func() (any, error) {
-		if v, ok := postFragmentsTop3.Load(p.ID); ok {
-			return v.(*postFragment), nil
-		}
-		f := renderPostFragment(p)
-		postFragmentsTop3.Store(p.ID, f)
-		return f, nil
-	})
-	return v.(*postFragment)
-}
 
 // GET / の rendered HTML をセッション (csrf_token + me_id) 単位でキャッシュ
 // 投稿があれば cacheVersion を bump して全エントリを実質無効化
@@ -1425,8 +1338,6 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	})
 	incCommentCount(postID, me.ID)
 	invalidatePostCache(postID)
-	invalidatePostFragment(postID) // top3 fragment は新コメントで内容変わる
-	invalidateIndexCache()         // cachedIndexPosts も新コメント反映のため (fragment 再 render 時に fresh comments が要る)
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
