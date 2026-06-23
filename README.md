@@ -2,12 +2,15 @@
 
 日本CTO協会 合同ISUCON研修 2026 (private-isu) の作業ディレクトリ。
 
-## サーバー情報
+## セットアップ
 
-- ServerPublicIP: `35.79.218.21`
-- ServerSecurityGroupId: `sg-0988728b9277180f8`
-- SSH KeyPair: `~/.ssh/ws-default-keypair.pem`
-- ログインユーザー: `isucon`
+```sh
+cp .env.local.example .env.local
+$EDITOR .env.local  # サーバー IP / SSH 鍵パスを書く
+source .env.local
+```
+
+`scripts/*.sh` は `ISUCON_HOST` / `ISUCON_USER` / `ISUCON_KEY` を環境変数で読みます。
 
 ## アプリ構成 (サーバー側)
 
@@ -43,10 +46,18 @@ sudo systemctl start isu-go
 
 # ベンチマーク実行
 ./scripts/bench.sh
+
+# ベンチ走らせて alp + mysqldumpslow まで一気に取る
+./scripts/measure.sh
 ```
+
+## 計測
+
+- `alp` (ローカル `brew install alp` 済) で nginx LTSV access log を集計
+- MySQL slow query log (`long_query_time=0`) を `mysqldumpslow` で集計
+- 結果は `measurements/<timestamp>/` に保存 (gitignore)
 
 ## 参考
 
 - ワークショップ: https://catalog.us-east-1.prod.workshops.aws/event/dashboard/ja-JP/workshop/performance-tuning/hands-on
 - レギュレーション: https://github.com/catatsuy/private-isu/blob/master/public_manual.md
-- 作業ログ: `~/Documents/MyVault/ISUCON研修.md`

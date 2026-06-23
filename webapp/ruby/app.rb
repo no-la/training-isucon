@@ -21,6 +21,11 @@ module Isuconp
     IMAGE_DIR = File.expand_path('../../public/image', __FILE__)
     IMAGE_EXT = { 'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif' }.freeze
 
+    # 短 TTL の per-worker process キャッシュ
+    INDEX_CACHE = { posts: nil, expires: 0.0 }
+    INDEX_CACHE_MUTEX = Mutex.new
+    INDEX_CACHE_TTL = 0.5
+
     helpers do
       def config
         @config ||= {
@@ -248,16 +253,31 @@ module Isuconp
 
     get '/' do
       me = get_session_user()
-
-      results = db.query(
-        'SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`created_at`, p.`mime` ' \
-        'FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` ' \
-        'WHERE u.`del_flg` = 0 ' \
-        'ORDER BY p.`created_at` DESC LIMIT 20'
-      )
-      posts = make_posts(results)
-
+      posts = cached_index_posts
       erb :index, layout: :layout, locals: { posts: posts, me: me }
+    end
+
+    helpers do
+      def cached_index_posts
+        now = Time.now.to_f
+        cached = INDEX_CACHE_MUTEX.synchronize do
+          INDEX_CACHE[:expires] > now ? INDEX_CACHE[:posts] : nil
+        end
+        return cached if cached
+
+        results = db.query(
+          'SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`created_at`, p.`mime` ' \
+          'FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` ' \
+          'WHERE u.`del_flg` = 0 ' \
+          'ORDER BY p.`created_at` DESC LIMIT 20'
+        )
+        posts = make_posts(results)
+        INDEX_CACHE_MUTEX.synchronize do
+          INDEX_CACHE[:posts] = posts
+          INDEX_CACHE[:expires] = Time.now.to_f + INDEX_CACHE_TTL
+        end
+        posts
+      end
     end
 
     get '/@:account_name' do

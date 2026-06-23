@@ -2,6 +2,7 @@
 .DS_Store
 .envrc
 .env
+.env.local
 tmp/
 logs/
 *.log
@@ -14,3 +15,4 @@ webapp/node/node_modules/
 webapp/ruby/vendor/
 webapp/ruby/.bundle/
 webapp/php/vendor/
+measurements/

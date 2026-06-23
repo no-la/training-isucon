@@ -11,3 +11,8 @@ sync_binlog = 0
 disable-log-bin
 
 max_connections = 512
+
+# 計測用 slow query log (long_query_time=0 で全クエリを記録)
+slow_query_log = 1
+slow_query_log_file = /var/log/mysql/mysql-slow.log
+long_query_time = 0
