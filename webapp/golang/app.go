@@ -434,7 +434,6 @@ func dbInitialize(ctx context.Context) {
 	userPageCacheMap = sync.Map{}
 	indexHTMLCache = sync.Map{}
 	invalidateIndexCache()
-	invalidateSharedIndex()
 	bumpCacheVersion()
 }
 
@@ -710,34 +709,6 @@ func invalidateIndexCache() {
 
 var indexFlight singleflight.Group
 
-// 共有 HTML cache: セッション間で 1 つの bytes を使い回し、CSRFToken と Me.AccountName だけ
-// per-request で string replace。logged-in/out で別バージョンを持つ。admin と flash 時は素 render
-// HTML escape / URL escape されない素朴な ASCII 文字列にする。content 内に偶然
-// 出現しないようにユニークなマジック文字列にする
-const (
-	placeholderCSRF   = "ZZZCSRFXYZZZ"
-	placeholderMeName = "ZZZMENAMEXYZZZ"
-)
-
-type sharedIndexEntry struct {
-	out []byte // logged-out: Me.ID=0
-	in  []byte // logged-in: Me.ID=1, Authority=0 → AccountName placeholder
-}
-
-var (
-	sharedIndex     atomic.Pointer[sharedIndexEntry]
-	sharedIndexExp  atomic.Int64 // unix nano
-	sharedIndexLock sync.Mutex
-	sharedIndexTTL  = 2 * time.Second
-
-	indexHits   atomic.Uint64
-	indexMisses atomic.Uint64
-)
-
-func invalidateSharedIndex() {
-	sharedIndexExp.Store(0)
-}
-
 // GET / の rendered HTML をセッション (csrf_token + me_id) 単位でキャッシュ
 // 投稿があれば cacheVersion を bump して全エントリを実質無効化
 type cachedHTML struct {
@@ -997,31 +968,21 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	csrfToken := getCSRFToken(r)
 	me := getSessionUser(r)
 
-	// admin / flash 時は cache を使わず素 render
-	if me.Authority == 1 || flash != "" {
-		renderIndexUncached(w, ctx, me, csrfToken, flash)
-		return
+	// flash がある場合は一過性なのでキャッシュしない (consume されたら次回は無いはず)
+	cacheable := flash == ""
+	cacheKey := csrfToken + "|" + strconv.Itoa(me.ID)
+
+	if cacheable {
+		curVer := cacheVersion.Load()
+		if v, ok := indexHTMLCache.Load(cacheKey); ok {
+			c := v.(*cachedHTML)
+			if c.version == curVer && time.Now().Before(c.expires) {
+				_, _ = w.Write(c.html)
+				return
+			}
+		}
 	}
 
-	entry, err := loadSharedIndex(ctx)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	var html []byte
-	if me.ID == 0 {
-		// logged-out: CSRFToken だけ差し替え (Me 不要)
-		html = bytes.ReplaceAll(entry.out, []byte(placeholderCSRF), []byte(csrfToken))
-	} else {
-		// logged-in: AccountName と CSRFToken を差し替え
-		html = bytes.ReplaceAll(entry.in, []byte(placeholderMeName), []byte(me.AccountName))
-		html = bytes.ReplaceAll(html, []byte(placeholderCSRF), []byte(csrfToken))
-	}
-	_, _ = w.Write(html)
-}
-
-func renderIndexUncached(w http.ResponseWriter, ctx context.Context, me User, csrfToken, flash string) {
 	cached, err := cachedIndexPosts(ctx)
 	if err != nil {
 		log.Print(err)
@@ -1032,75 +993,31 @@ func renderIndexUncached(w http.ResponseWriter, ctx context.Context, me User, cs
 		p.CSRFToken = csrfToken
 		posts[i] = p
 	}
-	renderTemplate(w, tmplIndex, struct {
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := tmplIndex.Execute(buf, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, csrfToken, flash})
-}
-
-// プレースホルダ入りで logged-out / logged-in の 2 バージョンを 1 度だけ render し共有
-func loadSharedIndex(ctx context.Context) (*sharedIndexEntry, error) {
-	if cur := sharedIndex.Load(); cur != nil {
-		if time.Now().UnixNano() < sharedIndexExp.Load() {
-			indexHits.Add(1)
-			return cur, nil
-		}
-	}
-	indexMisses.Add(1)
-
-	sharedIndexLock.Lock()
-	defer sharedIndexLock.Unlock()
-	// double-check
-	if cur := sharedIndex.Load(); cur != nil {
-		if time.Now().UnixNano() < sharedIndexExp.Load() {
-			return cur, nil
-		}
+	}{posts, me, csrfToken, flash}); err != nil {
+		log.Print(err)
+		bufPool.Put(buf)
+		return
 	}
 
-	cached, err := cachedIndexPosts(ctx)
-	if err != nil {
-		return nil, err
+	if cacheable {
+		html := make([]byte, buf.Len())
+		copy(html, buf.Bytes())
+		indexHTMLCache.Store(cacheKey, &cachedHTML{
+			html:    html,
+			version: cacheVersion.Load(),
+			expires: time.Now().Add(2 * time.Second),
+		})
 	}
-	posts := make([]Post, len(cached))
-	for i, p := range cached {
-		p.CSRFToken = placeholderCSRF
-		posts[i] = p
-	}
-
-	outBuf := bufPool.Get().(*bytes.Buffer)
-	outBuf.Reset()
-	if err := tmplIndex.Execute(outBuf, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, User{}, placeholderCSRF, ""}); err != nil {
-		bufPool.Put(outBuf)
-		return nil, err
-	}
-	outHTML := append([]byte(nil), outBuf.Bytes()...)
-	bufPool.Put(outBuf)
-
-	inBuf := bufPool.Get().(*bytes.Buffer)
-	inBuf.Reset()
-	if err := tmplIndex.Execute(inBuf, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, User{ID: 1, AccountName: placeholderMeName, Authority: 0}, placeholderCSRF, ""}); err != nil {
-		bufPool.Put(inBuf)
-		return nil, err
-	}
-	inHTML := append([]byte(nil), inBuf.Bytes()...)
-	bufPool.Put(inBuf)
-
-	e := &sharedIndexEntry{out: outHTML, in: inHTML}
-	sharedIndex.Store(e)
-	sharedIndexExp.Store(time.Now().Add(sharedIndexTTL).UnixNano())
-	return e, nil
+	_, _ = w.Write(buf.Bytes())
+	bufPool.Put(buf)
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -1375,7 +1292,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	// 投稿があった: cacheVersion を bump して既存 HTML キャッシュを無効化
 	bumpCacheVersion()
 	invalidateIndexCache()
-	invalidateSharedIndex()
 	// INDEX_CACHE は TTL 任せ
 	// POST のたび invalidate すると thundering herd で MySQL に殺到するため
 
@@ -1555,21 +1471,6 @@ func main() {
 	r.Get("/admin/banned", getAdminBanned)
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
-	r.Get("/debug/stats", func(w http.ResponseWriter, r *http.Request) {
-		ih := indexHits.Load()
-		im := indexMisses.Load()
-		total := ih + im
-		hitRate := 0.0
-		if total > 0 {
-			hitRate = float64(ih) / float64(total)
-		}
-		fmt.Fprintf(w, "shared_index hits=%d misses=%d hit_rate=%.3f cacheVersion=%d\n", ih, im, hitRate, cacheVersion.Load())
-	})
-	r.Post("/debug/reset", func(w http.ResponseWriter, r *http.Request) {
-		indexHits.Store(0)
-		indexMisses.Store(0)
-		w.Write([]byte("ok\n"))
-	})
 	r.Mount("/", http.FileServer(http.Dir("../public")))
 
 	// Unix domain socket で nginx と通信。TCP localhost より context switch / syscall が少ない
