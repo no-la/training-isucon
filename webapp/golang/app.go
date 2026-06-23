@@ -1289,11 +1289,10 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		Body:      r.FormValue("body"),
 		CreatedAt: time.Now(),
 	})
-	// 投稿があった: cacheVersion を bump して既存 HTML キャッシュを無効化
-	bumpCacheVersion()
+	// iter27: bumpCacheVersion() を撤去。POST / が秒間 25 回起きて全 HTML cache
+	// を毎回 stale 扱いにしていた (hit rate 21%)。TTL 2s に任せ、新 post の visibility
+	// は最大 2s 遅れる程度に許容する
 	invalidateIndexCache()
-	// INDEX_CACHE は TTL 任せ
-	// POST のたび invalidate すると thundering herd で MySQL に殺到するため
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
