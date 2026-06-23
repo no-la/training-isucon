@@ -709,88 +709,6 @@ func invalidateIndexCache() {
 
 var indexFlight singleflight.Group
 
-// chunked shared HTML cache: rendered output を placeholder 位置で分割し、
-// per-request は ResponseWriter に chunks を順番に Write するだけ (alloc 0)
-const (
-	phCSRF   = "ZZZCSRFXYZZZ"
-	phMeName = "ZZZMENAMEXYZZZ"
-)
-
-type slotKind uint8
-
-const (
-	slotCSRF slotKind = iota
-	slotMeName
-)
-
-// chunks の間に slots を挟む形: chunks[0] slots[0] chunks[1] slots[1] ... chunks[N]
-type chunkedHTML struct {
-	chunks [][]byte
-	slots  []slotKind
-}
-
-func parseChunks(html []byte) *chunkedHTML {
-	c := &chunkedHTML{}
-	rest := html
-	for len(rest) > 0 {
-		// 先頭の placeholder の位置と種類を探す
-		idxCSRF := bytes.Index(rest, []byte(phCSRF))
-		idxMe := bytes.Index(rest, []byte(phMeName))
-
-		// どちらも無い
-		if idxCSRF < 0 && idxMe < 0 {
-			c.chunks = append(c.chunks, rest)
-			return c
-		}
-
-		var idx int
-		var k slotKind
-		var plen int
-		if idxCSRF >= 0 && (idxMe < 0 || idxCSRF < idxMe) {
-			idx, k, plen = idxCSRF, slotCSRF, len(phCSRF)
-		} else {
-			idx, k, plen = idxMe, slotMeName, len(phMeName)
-		}
-		c.chunks = append(c.chunks, rest[:idx])
-		c.slots = append(c.slots, k)
-		rest = rest[idx+plen:]
-	}
-	return c
-}
-
-func (c *chunkedHTML) writeTo(w io.Writer, csrf, meName string) {
-	for i, chunk := range c.chunks {
-		w.Write(chunk)
-		if i < len(c.slots) {
-			switch c.slots[i] {
-			case slotCSRF:
-				io.WriteString(w, csrf)
-			case slotMeName:
-				io.WriteString(w, meName)
-			}
-		}
-	}
-}
-
-type sharedIndexEntry struct {
-	out *chunkedHTML // logged-out
-	in  *chunkedHTML // logged-in (Authority=0)
-}
-
-var (
-	sharedIndex     atomic.Pointer[sharedIndexEntry]
-	sharedIndexExp  atomic.Int64
-	sharedIndexLock sync.Mutex
-	sharedIndexTTL  = 2 * time.Second
-
-	indexHits   atomic.Uint64
-	indexMisses atomic.Uint64
-)
-
-func invalidateSharedIndex() {
-	sharedIndexExp.Store(0)
-}
-
 // GET / の rendered HTML をセッション (csrf_token + me_id) 単位でキャッシュ
 // 投稿があれば cacheVersion を bump して全エントリを実質無効化
 type cachedHTML struct {
@@ -1050,30 +968,21 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	csrfToken := getCSRFToken(r)
 	me := getSessionUser(r)
 
-	// admin or flash あり: 共有 cache をバイパスして素 render
-	if me.Authority == 1 || flash != "" {
-		renderIndexUncached(w, ctx, me, csrfToken, flash)
-		return
+	// flash がある場合は一過性なのでキャッシュしない (consume されたら次回は無いはず)
+	cacheable := flash == ""
+	cacheKey := csrfToken + "|" + strconv.Itoa(me.ID)
+
+	if cacheable {
+		curVer := cacheVersion.Load()
+		if v, ok := indexHTMLCache.Load(cacheKey); ok {
+			c := v.(*cachedHTML)
+			if c.version == curVer && time.Now().Before(c.expires) {
+				_, _ = w.Write(c.html)
+				return
+			}
+		}
 	}
 
-	entry, err := loadSharedIndex(ctx)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	if me.ID == 0 {
-		entry.out.writeTo(buf, csrfToken, "")
-	} else {
-		entry.in.writeTo(buf, csrfToken, me.AccountName)
-	}
-	_, _ = w.Write(buf.Bytes())
-	bufPool.Put(buf)
-}
-
-func renderIndexUncached(w http.ResponseWriter, ctx context.Context, me User, csrfToken, flash string) {
 	cached, err := cachedIndexPosts(ctx)
 	if err != nil {
 		log.Print(err)
@@ -1084,77 +993,31 @@ func renderIndexUncached(w http.ResponseWriter, ctx context.Context, me User, cs
 		p.CSRFToken = csrfToken
 		posts[i] = p
 	}
-	renderTemplate(w, tmplIndex, struct {
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := tmplIndex.Execute(buf, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, csrfToken, flash})
-}
-
-// プレースホルダ入り HTML を 1 回 render + chunk 化して共有
-func loadSharedIndex(ctx context.Context) (*sharedIndexEntry, error) {
-	if cur := sharedIndex.Load(); cur != nil {
-		if time.Now().UnixNano() < sharedIndexExp.Load() {
-			indexHits.Add(1)
-			return cur, nil
-		}
-	}
-	indexMisses.Add(1)
-
-	sharedIndexLock.Lock()
-	defer sharedIndexLock.Unlock()
-	if cur := sharedIndex.Load(); cur != nil {
-		if time.Now().UnixNano() < sharedIndexExp.Load() {
-			return cur, nil
-		}
+	}{posts, me, csrfToken, flash}); err != nil {
+		log.Print(err)
+		bufPool.Put(buf)
+		return
 	}
 
-	cached, err := cachedIndexPosts(ctx)
-	if err != nil {
-		return nil, err
+	if cacheable {
+		html := make([]byte, buf.Len())
+		copy(html, buf.Bytes())
+		indexHTMLCache.Store(cacheKey, &cachedHTML{
+			html:    html,
+			version: cacheVersion.Load(),
+			expires: time.Now().Add(2 * time.Second),
+		})
 	}
-	posts := make([]Post, len(cached))
-	for i, p := range cached {
-		p.CSRFToken = phCSRF
-		posts[i] = p
-	}
-
-	outBuf := bufPool.Get().(*bytes.Buffer)
-	outBuf.Reset()
-	if err := tmplIndex.Execute(outBuf, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, User{}, phCSRF, ""}); err != nil {
-		bufPool.Put(outBuf)
-		return nil, err
-	}
-	outBytes := append([]byte(nil), outBuf.Bytes()...)
-	bufPool.Put(outBuf)
-
-	inBuf := bufPool.Get().(*bytes.Buffer)
-	inBuf.Reset()
-	if err := tmplIndex.Execute(inBuf, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, User{ID: 1, AccountName: phMeName, Authority: 0}, phCSRF, ""}); err != nil {
-		bufPool.Put(inBuf)
-		return nil, err
-	}
-	inBytes := append([]byte(nil), inBuf.Bytes()...)
-	bufPool.Put(inBuf)
-
-	e := &sharedIndexEntry{
-		out: parseChunks(outBytes),
-		in:  parseChunks(inBytes),
-	}
-	sharedIndex.Store(e)
-	sharedIndexExp.Store(time.Now().Add(sharedIndexTTL).UnixNano())
-	return e, nil
+	_, _ = w.Write(buf.Bytes())
+	bufPool.Put(buf)
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -1429,7 +1292,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	// 投稿があった: cacheVersion を bump して既存 HTML キャッシュを無効化
 	bumpCacheVersion()
 	invalidateIndexCache()
-	invalidateSharedIndex()
 	// INDEX_CACHE は TTL 任せ
 	// POST のたび invalidate すると thundering herd で MySQL に殺到するため
 
@@ -1609,21 +1471,6 @@ func main() {
 	r.Get("/admin/banned", getAdminBanned)
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
-	r.Get("/debug/stats", func(w http.ResponseWriter, r *http.Request) {
-		ih := indexHits.Load()
-		im := indexMisses.Load()
-		total := ih + im
-		hr := 0.0
-		if total > 0 {
-			hr = float64(ih) / float64(total)
-		}
-		fmt.Fprintf(w, "shared_index hits=%d misses=%d hit_rate=%.3f bumps=%d\n", ih, im, hr, cacheVersion.Load())
-	})
-	r.Post("/debug/reset", func(w http.ResponseWriter, r *http.Request) {
-		indexHits.Store(0)
-		indexMisses.Store(0)
-		w.Write([]byte("ok\n"))
-	})
 	r.Mount("/", http.FileServer(http.Dir("../public")))
 
 	// Unix domain socket で nginx と通信。TCP localhost より context switch / syscall が少ない
