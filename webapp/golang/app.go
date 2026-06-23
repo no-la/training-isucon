@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1396,5 +1397,15 @@ func main() {
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
 	r.Mount("/", http.FileServer(http.Dir("../public")))
 
-	log.Fatal(http.ListenAndServe(":8080", r))
+	// Unix domain socket で nginx と通信。TCP localhost より context switch / syscall が少ない
+	sockPath := "/tmp/isu-go.sock"
+	_ = os.Remove(sockPath)
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		log.Fatalf("listen unix: %v", err)
+	}
+	if err := os.Chmod(sockPath, 0666); err != nil {
+		log.Printf("chmod sock: %v", err)
+	}
+	log.Fatal(http.Serve(l, r))
 }
