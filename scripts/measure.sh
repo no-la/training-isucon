@@ -12,12 +12,16 @@ mkdir -p "$OUT"
 
 SSH="ssh -i $KEY $USER@$HOST"
 
-echo "== rotate logs =="
-$SSH "sudo truncate -s 0 /var/log/nginx/access.log /var/log/mysql/mysql-slow.log"
+echo "== rotate logs & enable slow log =="
+$SSH "sudo truncate -s 0 /var/log/nginx/access.log /var/log/mysql/mysql-slow.log && mysql -u isuconp -pisuconp -e 'SET GLOBAL slow_query_log = ON;'"
+
+trap '$SSH "mysql -u isuconp -pisuconp -e \"SET GLOBAL slow_query_log = OFF;\"" >/dev/null 2>&1 || true' EXIT
 
 echo "== run benchmark =="
 $SSH '/home/isucon/private_isu/benchmarker/bin/benchmarker -u /home/isucon/private_isu/benchmarker/userdata -t http://localhost' \
   | tee "$OUT/bench.json"
+
+$SSH "mysql -u isuconp -pisuconp -e 'SET GLOBAL slow_query_log = OFF;'" >/dev/null 2>&1 || true
 
 echo "== fetch logs =="
 $SSH 'sudo cat /var/log/nginx/access.log' > "$OUT/access.log"

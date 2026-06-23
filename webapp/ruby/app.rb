@@ -284,35 +284,17 @@ module Isuconp
       user = db.prepare('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0').execute(
         params[:account_name]
       ).first
+      return 404 if user.nil?
 
-      if user.nil?
-        return 404
-      end
-
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20').execute(
-        user[:id]
-      )
+      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20').execute(user[:id])
       posts = make_posts(results)
 
-      comment_count = db.prepare('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).first[:count]
-
-      post_ids = db.prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).map{|post| post[:id]}
-      post_count = post_ids.length
-
-      commented_count = 0
-      if post_count > 0
-        placeholder = (['?'] * post_ids.length).join(",")
-        commented_count = db.prepare("SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (#{placeholder})").execute(
-          *post_ids
-        ).first[:count]
-      end
+      comment_count = db.prepare('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?').execute(user[:id]).first[:count]
+      post_count = db.prepare('SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?').execute(user[:id]).first[:count]
+      commented_count = post_count == 0 ? 0 :
+        db.prepare('SELECT COUNT(*) AS count FROM `comments` c JOIN `posts` p ON c.`post_id` = p.`id` WHERE p.`user_id` = ?').execute(user[:id]).first[:count]
 
       me = get_session_user()
-
       erb :user, layout: :layout, locals: { posts: posts, user: user, post_count: post_count, comment_count: comment_count, commented_count: commented_count, me: me }
     end
 
@@ -324,26 +306,18 @@ module Isuconp
         'WHERE u.`del_flg` = 0 AND p.`created_at` <= ? ' \
         'ORDER BY p.`created_at` DESC LIMIT 20'
       ).execute(
-        max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime
+        max_created_at.nil? || max_created_at.empty? ? nil : Time.iso8601(max_created_at).localtime
       )
       posts = make_posts(results)
-
       erb :posts, layout: false, locals: { posts: posts }
     end
 
     get '/posts/:id' do
-      results = db.prepare('SELECT * FROM `posts` WHERE `id` = ?').execute(
-        params[:id]
-      )
+      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?').execute(params[:id])
       posts = make_posts(results, all_comments: true)
-
-      return 404 if posts.length == 0
-
-      post = posts[0]
-
+      return 404 if posts.empty?
       me = get_session_user()
-
-      erb :post, layout: :layout, locals: { post: post, me: me }
+      erb :post, layout: :layout, locals: { post: posts[0], me: me }
     end
 
     post '/' do
