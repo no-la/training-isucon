@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -431,7 +432,9 @@ func dbInitialize(ctx context.Context) {
 	postsListCacheMap = sync.Map{}
 	postCacheMap = sync.Map{}
 	userPageCacheMap = sync.Map{}
+	indexHTMLCache = sync.Map{}
 	invalidateIndexCache()
+	bumpCacheVersion()
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
@@ -706,6 +709,23 @@ func invalidateIndexCache() {
 
 var indexFlight singleflight.Group
 
+// GET / の rendered HTML をセッション (csrf_token + me_id) 単位でキャッシュ
+// 投稿があれば cacheVersion を bump して全エントリを実質無効化
+type cachedHTML struct {
+	html    []byte
+	version uint64
+	expires time.Time
+}
+
+var (
+	indexHTMLCache sync.Map // map[string]*cachedHTML
+	cacheVersion   atomic.Uint64
+)
+
+func bumpCacheVersion() {
+	cacheVersion.Add(1)
+}
+
 // post_id ごとに make_posts 結果 (all_comments=true) を短期キャッシュ
 type cachedPost struct {
 	post    Post
@@ -944,27 +964,60 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	me := getSessionUser(r)
+	flash := getFlash(w, r, "notice")
 	csrfToken := getCSRFToken(r)
+	me := getSessionUser(r)
+
+	// flash がある場合は一過性なのでキャッシュしない (consume されたら次回は無いはず)
+	cacheable := flash == ""
+	cacheKey := csrfToken + "|" + strconv.Itoa(me.ID)
+
+	if cacheable {
+		curVer := cacheVersion.Load()
+		if v, ok := indexHTMLCache.Load(cacheKey); ok {
+			c := v.(*cachedHTML)
+			if c.version == curVer && time.Now().Before(c.expires) {
+				_, _ = w.Write(c.html)
+				return
+			}
+		}
+	}
 
 	cached, err := cachedIndexPosts(ctx)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	// CSRFToken はリクエストごとに差し替え
 	posts := make([]Post, len(cached))
 	for i, p := range cached {
 		p.CSRFToken = csrfToken
 		posts[i] = p
 	}
 
-	renderTemplate(w, tmplIndex, struct {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := tmplIndex.Execute(buf, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, csrfToken, getFlash(w, r, "notice")})
+	}{posts, me, csrfToken, flash}); err != nil {
+		log.Print(err)
+		bufPool.Put(buf)
+		return
+	}
+
+	if cacheable {
+		html := make([]byte, buf.Len())
+		copy(html, buf.Bytes())
+		indexHTMLCache.Store(cacheKey, &cachedHTML{
+			html:    html,
+			version: cacheVersion.Load(),
+			expires: time.Now().Add(2 * time.Second),
+		})
+	}
+	_, _ = w.Write(buf.Bytes())
+	bufPool.Put(buf)
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -1236,6 +1289,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		Body:      r.FormValue("body"),
 		CreatedAt: time.Now(),
 	})
+	// 投稿があった: cacheVersion を bump して既存 HTML キャッシュを無効化
+	bumpCacheVersion()
+	invalidateIndexCache()
 	// INDEX_CACHE は TTL 任せ
 	// POST のたび invalidate すると thundering herd で MySQL に殺到するため
 
@@ -1334,6 +1390,7 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = reloadUsersCache(ctx)
 	invalidateIndexCache()
+	bumpCacheVersion()
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
