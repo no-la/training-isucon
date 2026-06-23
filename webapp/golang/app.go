@@ -72,6 +72,54 @@ type Comment struct {
 
 var memcacheClient *memcache.Client
 
+// users 全件オンメモリ。1007 件 + α、変更は POST /register, /admin/banned, /initialize のみ
+var (
+	usersByID      = map[int]User{}
+	usersByName    = map[string]User{}
+	usersCacheMu   sync.RWMutex
+	usersCacheInit = false
+)
+
+func reloadUsersCache(ctx context.Context) error {
+	var users []User
+	if err := db.SelectContext(ctx, &users, "SELECT * FROM `users`"); err != nil {
+		return err
+	}
+	byID := make(map[int]User, len(users))
+	byName := make(map[string]User, len(users))
+	for _, u := range users {
+		byID[u.ID] = u
+		byName[u.AccountName] = u
+	}
+	usersCacheMu.Lock()
+	usersByID = byID
+	usersByName = byName
+	usersCacheInit = true
+	usersCacheMu.Unlock()
+	return nil
+}
+
+func userByID(id int) (User, bool) {
+	usersCacheMu.RLock()
+	u, ok := usersByID[id]
+	usersCacheMu.RUnlock()
+	return u, ok
+}
+
+func userByName(name string) (User, bool) {
+	usersCacheMu.RLock()
+	u, ok := usersByName[name]
+	usersCacheMu.RUnlock()
+	return u, ok
+}
+
+func upsertUser(u User) {
+	usersCacheMu.Lock()
+	usersByID[u.ID] = u
+	usersByName[u.AccountName] = u
+	usersCacheMu.Unlock()
+}
+
 // 起動時に一度だけパースしておく（毎リクエスト ParseFiles するコストを排除）
 var (
 	tmplIndex       *template.Template
@@ -127,14 +175,14 @@ func dbInitialize(ctx context.Context) {
 	for _, sql := range sqls {
 		db.ExecContext(ctx, sql)
 	}
-	// /initialize の後はインデックスページキャッシュも飛ばしておく
+	// /initialize 後はキャッシュを全部仕込み直す
+	_ = reloadUsersCache(ctx)
 	invalidateIndexCache()
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
-	u := User{}
-	err := db.GetContext(ctx, &u, "SELECT * FROM users WHERE account_name = ? AND del_flg = 0", accountName)
-	if err != nil {
+	u, ok := userByName(accountName)
+	if !ok || u.DelFlg != 0 {
 		return nil
 	}
 	if calculatePasshash(u.AccountName, password) == u.Passhash {
@@ -168,17 +216,25 @@ func getSession(r *http.Request) *sessions.Session {
 }
 
 func getSessionUser(r *http.Request) User {
-	ctx := r.Context()
 	session := getSession(r)
 	uid, ok := session.Values["user_id"]
 	if !ok || uid == nil {
 		return User{}
 	}
-	u := User{}
-	if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid); err != nil {
+	// session の user_id 型は INSERT の戻り値で int64、Get 系で int になることがある
+	var id int
+	switch v := uid.(type) {
+	case int:
+		id = v
+	case int64:
+		id = int(v)
+	default:
 		return User{}
 	}
-	return u
+	if u, found := userByID(id); found {
+		return u
+	}
+	return User{}
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
@@ -298,15 +354,14 @@ func fetchUsersByIDs(ctx context.Context, ids []int) (map[int]User, error) {
 	if len(ids) == 0 {
 		return map[int]User{}, nil
 	}
-	var users []User
-	q := "SELECT * FROM `users` WHERE `id` IN (" + placeholders(len(ids)) + ")"
-	if err := db.SelectContext(ctx, &users, q, intsToArgs(ids)...); err != nil {
-		return nil, err
+	out := make(map[int]User, len(ids))
+	usersCacheMu.RLock()
+	for _, id := range ids {
+		if u, ok := usersByID[id]; ok {
+			out[id] = u
+		}
 	}
-	out := make(map[int]User, len(users))
-	for _, u := range users {
-		out[u.ID] = u
-	}
+	usersCacheMu.RUnlock()
 	return out, nil
 }
 
@@ -406,7 +461,7 @@ var (
 	indexCacheMu   sync.RWMutex
 	indexCache     []Post
 	indexCacheTime time.Time
-	indexCacheTTL  = 500 * time.Millisecond
+	indexCacheTTL  = 5 * time.Second
 )
 
 func invalidateIndexCache() {
@@ -508,9 +563,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exists := 0
-	db.GetContext(ctx, &exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
-	if exists == 1 {
+	if _, exists := userByName(accountName); exists {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名がすでに使われています"
 		session.Save(r, w)
@@ -518,19 +571,25 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	passhash := calculatePasshash(accountName, password)
 	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, err := db.ExecContext(ctx, query, accountName, calculatePasshash(accountName, password))
+	result, err := db.ExecContext(ctx, query, accountName, passhash)
 	if err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	session := getSession(r)
-	uid, err := result.LastInsertId()
+	uid64, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	uid := int(uid64)
+	upsertUser(User{ID: uid, AccountName: accountName, Passhash: passhash, Authority: 0, DelFlg: 0, CreatedAt: time.Now()})
+
+	session := getSession(r)
 	session.Values["user_id"] = uid
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
@@ -573,12 +632,8 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 func getAccountName(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accountName := r.PathValue("accountName")
-	user := User{}
-	if err := db.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName); err != nil {
-		log.Print(err)
-		return
-	}
-	if user.ID == 0 {
+	user, ok := userByName(accountName)
+	if !ok || user.DelFlg != 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -843,11 +898,13 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := r.ParseForm(); err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?", 1, id)
 	}
+	_ = reloadUsersCache(ctx)
 	invalidateIndexCache()
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
@@ -897,6 +954,11 @@ func main() {
 	db.SetConnMaxLifetime(time.Hour)
 
 	parseTemplates()
+
+	// users キャッシュ初期化
+	if err := reloadUsersCache(context.Background()); err != nil {
+		log.Printf("warm users cache: %v", err)
+	}
 
 	r := chi.NewRouter()
 
