@@ -72,6 +72,68 @@ type Comment struct {
 
 var memcacheClient *memcache.Client
 
+// comments(post_id) の COUNT を永続キャッシュ。post 追加では 0、comment 追加で +1。
+var (
+	commentCountByPost = map[int]int{}
+	commentCountByUser = map[int]int{}
+	commentCountMu     sync.RWMutex
+)
+
+func reloadCommentCountCache(ctx context.Context) error {
+	type row struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	var rows []row
+	if err := db.SelectContext(ctx, &rows, "SELECT `post_id`, COUNT(*) AS `count` FROM `comments` GROUP BY `post_id`"); err != nil {
+		return err
+	}
+	byPost := make(map[int]int, len(rows))
+	for _, r := range rows {
+		byPost[r.PostID] = r.Count
+	}
+
+	type urow struct {
+		UserID int `db:"user_id"`
+		Count  int `db:"count"`
+	}
+	var urows []urow
+	if err := db.SelectContext(ctx, &urows, "SELECT `user_id`, COUNT(*) AS `count` FROM `comments` GROUP BY `user_id`"); err != nil {
+		return err
+	}
+	byUser := make(map[int]int, len(urows))
+	for _, r := range urows {
+		byUser[r.UserID] = r.Count
+	}
+
+	commentCountMu.Lock()
+	commentCountByPost = byPost
+	commentCountByUser = byUser
+	commentCountMu.Unlock()
+	return nil
+}
+
+func incCommentCount(postID, userID int) {
+	commentCountMu.Lock()
+	commentCountByPost[postID]++
+	commentCountByUser[userID]++
+	commentCountMu.Unlock()
+}
+
+func getCommentCountForPost(id int) int {
+	commentCountMu.RLock()
+	c := commentCountByPost[id]
+	commentCountMu.RUnlock()
+	return c
+}
+
+func getCommentCountForUser(id int) int {
+	commentCountMu.RLock()
+	c := commentCountByUser[id]
+	commentCountMu.RUnlock()
+	return c
+}
+
 // users 全件オンメモリ。1007 件 + α、変更は POST /register, /admin/banned, /initialize のみ
 var (
 	usersByID      = map[int]User{}
@@ -177,6 +239,7 @@ func dbInitialize(ctx context.Context) {
 	}
 	// /initialize 後はキャッシュを全部仕込み直す
 	_ = reloadUsersCache(ctx)
+	_ = reloadCommentCountCache(ctx)
 	invalidateIndexCache()
 }
 
@@ -366,23 +429,12 @@ func fetchUsersByIDs(ctx context.Context, ids []int) (map[int]User, error) {
 }
 
 func fetchCommentCounts(ctx context.Context, ids []int) (map[int]int, error) {
-	if len(ids) == 0 {
-		return map[int]int{}, nil
-	}
-	type row struct {
-		PostID int `db:"post_id"`
-		Count  int `db:"count"`
-	}
-	var rows []row
-	q := "SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (" +
-		placeholders(len(ids)) + ") GROUP BY `post_id`"
-	if err := db.SelectContext(ctx, &rows, q, intsToArgs(ids)...); err != nil {
-		return nil, err
-	}
 	out := make(map[int]int, len(ids))
-	for _, r := range rows {
-		out[r.PostID] = r.Count
+	commentCountMu.RLock()
+	for _, id := range ids {
+		out[id] = commentCountByPost[id]
 	}
+	commentCountMu.RUnlock()
 	return out, nil
 }
 
@@ -651,16 +703,12 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	if err := db.GetContext(ctx, &commentCount,
-		"SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID); err != nil {
-		log.Print(err)
-		return
-	}
+	commentCount := getCommentCountForUser(user.ID)
 	postCount := 0
 	if err := db.GetContext(ctx, &postCount,
 		"SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID); err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	commentedCount := 0
@@ -668,6 +716,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		if err := db.GetContext(ctx, &commentedCount,
 			"SELECT COUNT(*) AS count FROM `comments` c JOIN `posts` p ON c.`post_id` = p.`id` WHERE p.`user_id` = ?", user.ID); err != nil {
 			log.Print(err)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 	}
@@ -852,8 +901,10 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		"INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)",
 		postID, me.ID, r.FormValue("comment")); err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	incCommentCount(postID, me.ID)
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
@@ -955,9 +1006,12 @@ func main() {
 
 	parseTemplates()
 
-	// users キャッシュ初期化
+	// users / comment_count キャッシュ初期化
 	if err := reloadUsersCache(context.Background()); err != nil {
 		log.Printf("warm users cache: %v", err)
+	}
+	if err := reloadCommentCountCache(context.Background()); err != nil {
+		log.Printf("warm comment_count cache: %v", err)
 	}
 
 	r := chi.NewRouter()

@@ -12,6 +12,11 @@ disable-log-bin
 
 max_connections = 512
 
+# bench 専用設定: 耐久より throughput
+innodb_doublewrite = 0
+innodb_flush_neighbors = 0
+performance_schema = OFF
+
 # 計測用 slow query log (long_query_time=0 で全クエリを記録)
 # 通常は OFF。scripts/measure.sh が一時的に ON にする
 slow_query_log = 0
