@@ -135,6 +135,117 @@ func getCommentCountForUser(id int) int {
 	return c
 }
 
+// posts (10k + α) を created_at DESC で常に並んだ slice として保持。
+// 主な操作: 末尾追加 (POST /) と上位 N 抽出 (GET /, GET /posts)。
+type lightPost struct {
+	ID        int
+	UserID    int
+	Mime      string
+	Body      string
+	CreatedAt time.Time
+}
+
+var (
+	postsByCreatedAtDesc []lightPost // [0] が最新
+	postsCacheMu         sync.RWMutex
+)
+
+func reloadPostsCache(ctx context.Context) error {
+	var rows []struct {
+		ID        int       `db:"id"`
+		UserID    int       `db:"user_id"`
+		Mime      string    `db:"mime"`
+		Body      string    `db:"body"`
+		CreatedAt time.Time `db:"created_at"`
+	}
+	if err := db.SelectContext(ctx, &rows,
+		"SELECT `id`, `user_id`, `mime`, `body`, `created_at` FROM `posts` ORDER BY `created_at` DESC"); err != nil {
+		return err
+	}
+	cache := make([]lightPost, len(rows))
+	for i, r := range rows {
+		cache[i] = lightPost{ID: r.ID, UserID: r.UserID, Mime: r.Mime, Body: r.Body, CreatedAt: r.CreatedAt}
+	}
+	postsCacheMu.Lock()
+	postsByCreatedAtDesc = cache
+	postsCacheMu.Unlock()
+	return nil
+}
+
+// 新規投稿を先頭に追加する。created_at は必ず現在時刻に近いので [0] へ
+func prependPost(p lightPost) {
+	postsCacheMu.Lock()
+	postsByCreatedAtDesc = append([]lightPost{p}, postsByCreatedAtDesc...)
+	postsCacheMu.Unlock()
+}
+
+// del_flg=0 のユーザーの投稿だけ拾い、先頭から最大 limit 件返す
+// maxCreatedAt が zero でなければ created_at <= maxCreatedAt も適用
+func selectPostsFromCache(maxCreatedAt time.Time, limit int) []Post {
+	postsCacheMu.RLock()
+	src := postsByCreatedAtDesc
+	postsCacheMu.RUnlock()
+
+	out := make([]Post, 0, limit)
+	for _, p := range src {
+		if !maxCreatedAt.IsZero() && p.CreatedAt.After(maxCreatedAt) {
+			continue
+		}
+		u, ok := userByID(p.UserID)
+		if !ok || u.DelFlg != 0 {
+			continue
+		}
+		out = append(out, Post{
+			ID:        p.ID,
+			UserID:    p.UserID,
+			Mime:      p.Mime,
+			Body:      p.Body,
+			CreatedAt: p.CreatedAt,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// 指定 user_id の最近の投稿 (LIMIT 20)。del_flg は外側で確認済前提
+func selectPostsByUserFromCache(userID int, limit int) []Post {
+	postsCacheMu.RLock()
+	src := postsByCreatedAtDesc
+	postsCacheMu.RUnlock()
+
+	out := make([]Post, 0, limit)
+	for _, p := range src {
+		if p.UserID != userID {
+			continue
+		}
+		out = append(out, Post{
+			ID:        p.ID,
+			UserID:    p.UserID,
+			Mime:      p.Mime,
+			Body:      p.Body,
+			CreatedAt: p.CreatedAt,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func postCountByUser(userID int) int {
+	postsCacheMu.RLock()
+	defer postsCacheMu.RUnlock()
+	n := 0
+	for _, p := range postsByCreatedAtDesc {
+		if p.UserID == userID {
+			n++
+		}
+	}
+	return n
+}
+
 // users 全件オンメモリ。1007 件 + α、変更は POST /register, /admin/banned, /initialize のみ
 var (
 	usersByID      = map[int]User{}
@@ -251,6 +362,11 @@ func dbInitialize(ctx context.Context) {
 	// /initialize 後はキャッシュを全部仕込み直す
 	_ = reloadUsersCache(ctx)
 	_ = reloadCommentCountCache(ctx)
+	_ = reloadPostsCache(ctx)
+	// /posts_list_cache, post_detail_cache は何のキーで保持してるか分からないので消す
+	postsListCacheMap = sync.Map{}
+	postCacheMap = sync.Map{}
+	userPageCacheMap = sync.Map{}
 	invalidateIndexCache()
 }
 
@@ -640,7 +756,6 @@ func cachedIndexPosts(ctx context.Context) ([]Post, error) {
 	indexCacheMu.RUnlock()
 
 	v, err, _ := indexFlight.Do("index", func() (any, error) {
-		// double-check: 先行 goroutine が更新してる可能性
 		indexCacheMu.RLock()
 		if indexCache != nil && time.Since(indexCacheTime) < indexCacheTTL {
 			c := indexCache
@@ -649,14 +764,8 @@ func cachedIndexPosts(ctx context.Context) ([]Post, error) {
 		}
 		indexCacheMu.RUnlock()
 
-		var results []Post
-		if err := db.SelectContext(ctx, &results,
-			"SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` "+
-				"FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` "+
-				"WHERE u.`del_flg` = 0 "+
-				"ORDER BY p.`created_at` DESC LIMIT 20"); err != nil {
-			return nil, err
-		}
+		// in-memory posts から最新 20 件 (del_flg=0)
+		results := selectPostsFromCache(time.Time{}, 20)
 		posts, err := makePosts(ctx, results, "", false)
 		if err != nil {
 			return nil, err
@@ -806,22 +915,32 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 func getAccountName(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accountName := r.PathValue("accountName")
-	data, err := getCachedUserPage(ctx, accountName)
+	user, ok := userByName(accountName)
+	if !ok || user.DelFlg != 0 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	results := selectPostsByUserFromCache(user.ID, 20)
+	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if data == nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
+
+	commentCount := getCommentCountForUser(user.ID)
+	postCount := postCountByUser(user.ID)
+	commentedCount := 0
+	if postCount > 0 {
+		if err := db.GetContext(ctx, &commentedCount,
+			"SELECT COUNT(*) AS count FROM `comments` c JOIN `posts` p ON c.`post_id` = p.`id` WHERE p.`user_id` = ?", user.ID); err != nil {
+			log.Print(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	}
-	csrfToken := getCSRFToken(r)
-	posts := make([]Post, len(data.posts))
-	for i, p := range data.posts {
-		p.CSRFToken = csrfToken
-		posts[i] = p
-	}
+
 	me := getSessionUser(r)
 	tmplUser.Execute(w, struct {
 		Posts          []Post
@@ -830,7 +949,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, data.user, data.postCount, data.commentCount, data.commentedCount, me})
+	}{posts, user, postCount, commentCount, commentedCount, me})
 }
 
 func getCachedUserPage(ctx context.Context, accountName string) (*cachedUserPage, error) {
@@ -854,23 +973,14 @@ func getCachedUserPage(ctx context.Context, accountName string) (*cachedUserPage
 			return nil, nil
 		}
 
-		var results []Post
-		if err := db.SelectContext(ctx, &results,
-			"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` "+
-				"WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID); err != nil {
-			return nil, err
-		}
+		results := selectPostsByUserFromCache(user.ID, 20)
 		posts, err := makePosts(ctx, results, "", false)
 		if err != nil {
 			return nil, err
 		}
 
 		commentCount := getCommentCountForUser(user.ID)
-		postCount := 0
-		if err := db.GetContext(ctx, &postCount,
-			"SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID); err != nil {
-			return nil, err
-		}
+		postCount := postCountByUser(user.ID)
 		commentedCount := 0
 		if postCount > 0 {
 			if err := db.GetContext(ctx, &commentedCount,
@@ -911,21 +1021,21 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	if maxCreatedAt == "" {
 		return
 	}
-	cached, err := getCachedPostsList(ctx, maxCreatedAt)
+	t, err := time.Parse(ISO8601Format, maxCreatedAt)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	results := selectPostsFromCache(t, 20)
+	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if len(cached) == 0 {
+	if len(posts) == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
-	}
-	csrfToken := getCSRFToken(r)
-	posts := make([]Post, len(cached))
-	for i, p := range cached {
-		p.CSRFToken = csrfToken
-		posts[i] = p
 	}
 	tmplPosts.Execute(w, posts)
 }
@@ -950,14 +1060,7 @@ func getCachedPostsList(ctx context.Context, maxCreatedAt string) ([]Post, error
 		if err != nil {
 			return nil, err
 		}
-		var results []Post
-		if err := db.SelectContext(ctx, &results,
-			"SELECT STRAIGHT_JOIN p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` "+
-				"FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` "+
-				"WHERE u.`del_flg` = 0 AND p.`created_at` <= ? "+
-				"ORDER BY p.`created_at` DESC LIMIT 20", t.Format(ISO8601Format)); err != nil {
-			return nil, err
-		}
+		results := selectPostsFromCache(t, 20)
 		posts, err := makePosts(ctx, results, "", false)
 		if err != nil {
 			return nil, err
@@ -1069,7 +1172,17 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 			log.Printf("disk write: %v", err)
 		}
 	}
-	// INDEX_CACHE は TTL 任せ。POST のたび invalidate すると thundering herd で MySQL に殺到する
+
+	// in-memory posts cache に先頭追加
+	prependPost(lightPost{
+		ID:        int(pid),
+		UserID:    me.ID,
+		Mime:      mime,
+		Body:      r.FormValue("body"),
+		CreatedAt: time.Now(),
+	})
+	// INDEX_CACHE は TTL 任せ
+	// POST のたび invalidate すると thundering herd で MySQL に殺到するため
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
@@ -1205,12 +1318,15 @@ func main() {
 
 	parseTemplates()
 
-	// users / comment_count キャッシュ初期化
+	// users / comment_count / posts キャッシュ初期化
 	if err := reloadUsersCache(context.Background()); err != nil {
 		log.Printf("warm users cache: %v", err)
 	}
 	if err := reloadCommentCountCache(context.Background()); err != nil {
 		log.Printf("warm comment_count cache: %v", err)
+	}
+	if err := reloadPostsCache(context.Background()); err != nil {
+		log.Printf("warm posts cache: %v", err)
 	}
 
 	r := chi.NewRouter()
