@@ -433,6 +433,7 @@ func dbInitialize(ctx context.Context) {
 	postCacheMap = sync.Map{}
 	userPageCacheMap = sync.Map{}
 	indexHTMLCache = sync.Map{}
+	postHTMLCache = sync.Map{}
 	invalidateIndexCache()
 	bumpCacheVersion()
 }
@@ -719,6 +720,7 @@ type cachedHTML struct {
 
 var (
 	indexHTMLCache sync.Map // map[string]*cachedHTML
+	postHTMLCache  sync.Map // map[string]*cachedHTML  (key = postID + "|" + csrf + "|" + meID)
 	cacheVersion   atomic.Uint64
 )
 
@@ -1192,7 +1194,19 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	p, err := cachedPostDetail(ctx, pid, getCSRFToken(r))
+	csrfToken := getCSRFToken(r)
+	me := getSessionUser(r)
+	cacheKey := strconv.Itoa(pid) + "|" + csrfToken + "|" + strconv.Itoa(me.ID)
+	curVer := cacheVersion.Load()
+	if v, ok := postHTMLCache.Load(cacheKey); ok {
+		c := v.(*cachedHTML)
+		if c.version == curVer && time.Now().Before(c.expires) {
+			_, _ = w.Write(c.html)
+			return
+		}
+	}
+
+	p, err := cachedPostDetail(ctx, pid, csrfToken)
 	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1202,11 +1216,26 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	me := getSessionUser(r)
-	renderTemplate(w, tmplPost, struct {
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := tmplPost.Execute(buf, struct {
 		Post Post
 		Me   User
-	}{*p, me})
+	}{*p, me}); err != nil {
+		log.Print(err)
+		bufPool.Put(buf)
+		return
+	}
+	html := make([]byte, buf.Len())
+	copy(html, buf.Bytes())
+	postHTMLCache.Store(cacheKey, &cachedHTML{
+		html:    html,
+		version: curVer,
+		expires: time.Now().Add(1 * time.Second),
+	})
+	_, _ = w.Write(buf.Bytes())
+	bufPool.Put(buf)
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
@@ -1338,6 +1367,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	})
 	incCommentCount(postID, me.ID)
 	invalidatePostCache(postID)
+	bumpCacheVersion()
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
