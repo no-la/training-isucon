@@ -434,6 +434,7 @@ func dbInitialize(ctx context.Context) {
 	userPageCacheMap = sync.Map{}
 	indexHTMLCache = sync.Map{}
 	invalidateIndexCache()
+	invalidateSharedIndex()
 	bumpCacheVersion()
 }
 
@@ -1374,6 +1375,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	// 投稿があった: cacheVersion を bump して既存 HTML キャッシュを無効化
 	bumpCacheVersion()
 	invalidateIndexCache()
+	invalidateSharedIndex()
 	// INDEX_CACHE は TTL 任せ
 	// POST のたび invalidate すると thundering herd で MySQL に殺到するため
 
